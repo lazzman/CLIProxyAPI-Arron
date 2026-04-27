@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	runtimeusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -86,6 +88,23 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	}
 	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+}
+
+func TestApplyCodexHeadersDefaultsOriginatorToCurrentCodexClient(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+
+	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
 	}
 }
 
@@ -249,6 +268,106 @@ func TestApplyCodexWebsocketHeadersSkipsGeneratedSessionIDForNonMacUserAgent(t *
 	if got := headers.Get("Session_id"); got != "" {
 		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
 	}
+}
+
+func TestApplyCodexPromptCacheHeadersOpenAIResponsesDoesNotForceSessionID(t *testing.T) {
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","prompt_cache_key":"cache-key-1"}`),
+	}
+
+	body, headers := applyCodexPromptCacheHeaders(sdktranslator.FromString("openai-response"), req, []byte(`{"model":"gpt-5.4"}`))
+
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "cache-key-1" {
+		t.Fatalf("prompt_cache_key = %q, want %q", got, "cache-key-1")
+	}
+	if got := headers.Get("Conversation_id"); got != "cache-key-1" {
+		t.Fatalf("Conversation_id = %q, want %q", got, "cache-key-1")
+	}
+	if got := headers.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+}
+
+func TestCodexWebsocketExecuteStream_PublishesUsageFromCompletedEvent(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, err = conn.ReadMessage(); err != nil {
+			t.Errorf("read websocket request: %v", err)
+			return
+		}
+
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ws","created_at":0,"model":"gpt-5.4"}}`))
+		time.Sleep(150 * time.Millisecond)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":8,"output_tokens":28,"total_tokens":36}}}`))
+	}))
+	defer server.Close()
+
+	apiKey := fmt.Sprintf("codex-ws-usage-%d", time.Now().UnixNano())
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Set("apiKey", apiKey)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	auth := newCodexTestAuth(server.URL, "ws-key")
+	auth.Attributes["websockets"] = "true"
+
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	preDeadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(preDeadline) {
+		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				t.Fatalf("unexpected early request statistics record before completed usage: failed=%v total_tokens=%d", detail.Failed, detail.Tokens.TotalTokens)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				if detail.Failed {
+					t.Fatal("expected successful request statistics record")
+				}
+				if detail.Tokens.TotalTokens != 36 {
+					t.Fatalf("total tokens = %d, want %d", detail.Tokens.TotalTokens, 36)
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for websocket usage statistics record for API key %q", apiKey)
 }
 
 func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutboundRequest(t *testing.T) {

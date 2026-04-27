@@ -30,7 +30,7 @@ import (
 
 const (
 	codexUserAgent  = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-	codexOriginator = "codex_cli_rs"
+	codexOriginator = "codex-tui"
 	// Give non-stream /responses a short chance to reach EOF so keep-alive
 	// connections can be reused without reintroducing long tail latency.
 	codexCompletedDrainGracePeriod = 100 * time.Millisecond
@@ -133,7 +133,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.finalize(ctx, &err)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanExecute)
@@ -152,6 +152,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	bindCodexPromptCacheSession(httpReq, plan.conversationID)
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -218,7 +219,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.finalize(ctx, &err)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanCompact)
@@ -237,6 +238,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	bindCodexPromptCacheSession(httpReq, plan.conversationID)
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -281,7 +283,6 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.publish(ctx, parseOpenAIUsage(data))
-	reporter.ensurePublished(ctx)
 	var param any
 	translateOriginalPayload, translateBody := originalPayload, body
 	if !codexResponseTranslatorNeedsRequestPayloads(from) {
@@ -305,7 +306,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.finalize(ctx, &err)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanExecuteStream)
@@ -324,6 +325,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	bindCodexPromptCacheSession(httpReq, plan.conversationID)
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -629,7 +631,12 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if conversationID != "" {
 		rawJSON = setJSONStringFieldIfNeeded(rawJSON, "prompt_cache_key", conversationID)
 	}
-	return newCodexHTTPRequest(ctx, url, rawJSON, conversationID)
+	httpReq, err := newCodexHTTPRequest(ctx, url, rawJSON, "")
+	if err != nil {
+		return nil, err
+	}
+	bindCodexPromptCacheSession(httpReq, conversationID)
+	return httpReq, nil
 }
 
 func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, reporter *usageReporter) ([]byte, error) {
@@ -650,7 +657,6 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
-					reporter.ensurePublished(ctx)
 					drainCodexCompletedBody(ctx, cfg, reader, body)
 					return bytes.Clone(data), nil
 				}
@@ -665,6 +671,14 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 		return nil, err
 	}
 	return nil, statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+}
+
+func bindCodexPromptCacheSession(httpReq *http.Request, conversationID string) {
+	if httpReq == nil || strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	httpReq.Header.Del("Conversation_id")
+	httpReq.Header.Set("Session_id", conversationID)
 }
 
 func drainCodexCompletedBody(ctx context.Context, cfg *config.Config, reader *bufio.Reader, body io.Closer) {

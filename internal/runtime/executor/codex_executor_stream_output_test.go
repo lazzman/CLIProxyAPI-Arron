@@ -95,3 +95,19 @@ func TestCodexExecutorExecuteStream_EmptyStreamCompletionOutputUsesOutputItemDon
 		t.Fatalf("response.output[0].content[0].text = %q, want %q; completed=%s", gotContent, "ok", string(completed))
 	}
 }
+
+func TestPatchCodexCompletedOutput_PreservesUsage(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":8,"output_tokens":28,"total_tokens":36}}}`)
+	outputItemsByIndex := map[int64][]byte{
+		0: []byte(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}`),
+	}
+
+	patched := patchCodexCompletedOutput(completed, outputItemsByIndex, nil)
+
+	if got := gjson.GetBytes(patched, "response.output.0.content.0.text").String(); got != "ok" {
+		t.Fatalf("response.output[0].content[0].text = %q, want %q; patched=%s", got, "ok", string(patched))
+	}
+	if got := gjson.GetBytes(patched, "response.usage.total_tokens").Int(); got != 36 {
+		t.Fatalf("response.usage.total_tokens = %d, want %d; patched=%s", got, 36, string(patched))
+	}
+}

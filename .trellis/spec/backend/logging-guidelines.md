@@ -128,6 +128,13 @@ The request summary line includes:
 - Aggregate usage metrics through the statistics plugin:
   `internal/usage/logger_plugin.go`
 
+## Codex Usage 统计发布约束
+
+- `usageReporter.finalize(...)` 会在没有错误时补发一条成功统计，这个语义只适合“返回前已经拿到最终 usage”的 provider。
+- Codex `/responses` 的 HTTP SSE 与 WebSocket 路径必须等到终态事件里的 `response.usage` 被解析后，才允许发布成功统计。
+- 如果 `response.completed` 或 `response.done` 缺失 `response.usage`，不要补发伪造的 `0 token` 成功统计。
+- Codex prompt cache 与请求会话绑定时，HTTP 请求只把 `Session_id` 绑定到 `prompt_cache_key`；WebSocket 的 `Conversation_id` 可以随 prompt cache 透传，但不要在 transport 级默认逻辑之前强行注入同值 `Session_id`。
+
 ---
 
 ## What NOT To Log

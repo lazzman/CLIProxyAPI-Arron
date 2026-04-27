@@ -29,12 +29,13 @@ import (
 )
 
 type codexCapturedRequest struct {
-	Path          string
-	Accept        string
-	Authorization string
-	Version       string
-	SessionID     string
-	Body          []byte
+	Path           string
+	Accept         string
+	Authorization  string
+	ConversationID string
+	Version        string
+	SessionID      string
+	Body           []byte
 }
 
 type codexStatusError interface {
@@ -54,12 +55,13 @@ func TestCodexExecutorExecute_LocalServer_SuccessAndHeaders(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		captured = codexCapturedRequest{
-			Path:          r.URL.Path,
-			Accept:        r.Header.Get("Accept"),
-			Authorization: r.Header.Get("Authorization"),
-			Version:       r.Header.Get("Version"),
-			SessionID:     r.Header.Get("Session_id"),
-			Body:          body,
+			Path:           r.URL.Path,
+			Accept:         r.Header.Get("Accept"),
+			Authorization:  r.Header.Get("Authorization"),
+			ConversationID: r.Header.Get("Conversation_id"),
+			Version:        r.Header.Get("Version"),
+			SessionID:      r.Header.Get("Session_id"),
+			Body:           body,
 		}
 		mu.Unlock()
 
@@ -95,6 +97,9 @@ func TestCodexExecutorExecute_LocalServer_SuccessAndHeaders(t *testing.T) {
 	if captured.SessionID == "" {
 		t.Fatal("expected Session_id header to be populated")
 	}
+	if captured.ConversationID != "" {
+		t.Fatalf("Conversation_id = %q, want empty by default", captured.ConversationID)
+	}
 	if gotModel := gjson.GetBytes(captured.Body, "model").String(); gotModel != "gpt-5.4" {
 		t.Fatalf("request model = %q, want %q", gotModel, "gpt-5.4")
 	}
@@ -112,6 +117,49 @@ func TestCodexExecutorExecute_LocalServer_SuccessAndHeaders(t *testing.T) {
 	}
 	if gotText := gjson.GetBytes(resp.Payload, "output.0.content.0.text").String(); gotText != "ok-success" {
 		t.Fatalf("response text = %q, want %q", gotText, "ok-success")
+	}
+}
+
+func TestCodexExecutorExecute_LocalServer_PromptCacheKeyBindsSessionIDOnly(t *testing.T) {
+	t.Parallel()
+
+	var captured codexCapturedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = codexCapturedRequest{
+			Path:           r.URL.Path,
+			ConversationID: r.Header.Get("Conversation_id"),
+			SessionID:      r.Header.Get("Session_id"),
+			Body:           body,
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+codexCompletedEventJSON("resp_prompt_cache", "gpt-5.4", "ok-cache")+"\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	_, err := executor.Execute(
+		context.Background(),
+		newCodexTestAuth(server.URL, "prompt-cache-key"),
+		cliproxyexecutor.Request{
+			Model:   "gpt-5.4",
+			Payload: []byte(`{"model":"gpt-5.4","input":"hello","prompt_cache_key":"cache-key-1"}`),
+		},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(captured.Body, "prompt_cache_key").String(); got != "cache-key-1" {
+		t.Fatalf("prompt_cache_key = %q, want %q", got, "cache-key-1")
+	}
+	if captured.ConversationID != "" {
+		t.Fatalf("Conversation_id = %q, want empty", captured.ConversationID)
+	}
+	if captured.SessionID != "cache-key-1" {
+		t.Fatalf("Session_id = %q, want %q", captured.SessionID, "cache-key-1")
 	}
 }
 
@@ -231,7 +279,7 @@ func TestCodexExecutorExecute_LocalServer_ReusesConnectionWhenCompletedEOFIsBrie
 	}
 }
 
-func TestCodexExecutorExecute_LocalServer_PublishesRequestStatsWithoutUsageFields(t *testing.T) {
+func TestCodexExecutorExecute_LocalServer_DoesNotPublishRequestStatsWithoutUsageFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: "+codexCompletedEventWithoutUsageJSON("resp_no_usage", "gpt-5.4", "ok-no-usage")+"\n")
@@ -258,30 +306,17 @@ func TestCodexExecutorExecute_LocalServer_PublishesRequestStatsWithoutUsageField
 		t.Fatalf("response id = %q, want %q", gotID, "resp_no_usage")
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
-		apiStats, ok := snapshot.APIs[apiKey]
-		if !ok {
-			time.Sleep(10 * time.Millisecond)
-			continue
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				t.Fatalf("unexpected request statistics record for usage-free completed event: failed=%v total_tokens=%d", detail.Failed, detail.Tokens.TotalTokens)
+			}
 		}
-		modelStats, ok := apiStats.Models["gpt-5.4"]
-		if !ok || len(modelStats.Details) == 0 {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		detail := modelStats.Details[len(modelStats.Details)-1]
-		if detail.Failed {
-			t.Fatal("expected successful request statistics record")
-		}
-		if detail.Tokens.TotalTokens != 0 {
-			t.Fatalf("total tokens = %d, want 0 for usage-free completed event", detail.Tokens.TotalTokens)
-		}
-		return
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	t.Fatalf("timed out waiting for usage statistics record for API key %q", apiKey)
 }
 
 func TestCodexExecutorExecuteCompact_LocalServer_RequestShapeAndPayload(t *testing.T) {
@@ -334,6 +369,57 @@ func TestCodexExecutorExecuteCompact_LocalServer_RequestShapeAndPayload(t *testi
 	if string(resp.Payload) != `{"id":"resp_compact","object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
 		t.Fatalf("payload = %s", string(resp.Payload))
 	}
+}
+
+func TestCodexExecutorExecuteCompact_LocalServer_PublishesUsageStats(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact_stats","object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`)
+	}))
+	defer server.Close()
+
+	apiKey := fmt.Sprintf("stats-compact-%d", time.Now().UnixNano())
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Set("apiKey", apiKey)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	executor := NewCodexExecutor(&config.Config{})
+	resp, err := executor.Execute(
+		ctx,
+		newCodexTestAuth(server.URL, "compact-stats-key"),
+		newCodexResponsesRequest("verify compact usage stats"),
+		cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai-response"),
+			Alt:          "responses/compact",
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() compact error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "usage.total_tokens").Int(); got != 3 {
+		t.Fatalf("compact payload usage.total_tokens = %d, want %d", got, 3)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				if detail.Failed {
+					t.Fatal("expected successful compact request statistics record")
+				}
+				if detail.Tokens.TotalTokens != 3 {
+					t.Fatalf("compact total tokens = %d, want %d", detail.Tokens.TotalTokens, 3)
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for compact usage statistics record for API key %q", apiKey)
 }
 
 func TestCodexExecutorExecute_LocalServer_Parses429RetryAfter(t *testing.T) {
@@ -444,6 +530,81 @@ func TestCodexExecutorExecuteStream_LocalServer_EmitsChunksAndCompletion(t *test
 	if !strings.Contains(chunks[2], `"type":"response.completed"`) {
 		t.Fatalf("third chunk = %q, want response.completed event", chunks[2])
 	}
+}
+
+func TestCodexExecutorExecuteStream_DoesNotPublishZeroTokenBeforeCompletedUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		time.Sleep(150 * time.Millisecond)
+
+		_, _ = io.WriteString(w, "data: "+codexCompletedEventJSON("resp_stream_stats", "gpt-5.4", "hello stream")+"\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	apiKey := fmt.Sprintf("stats-http-stream-%d", time.Now().UnixNano())
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Set("apiKey", apiKey)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	executor := NewCodexExecutor(&config.Config{})
+	result, err := executor.ExecuteStream(
+		ctx,
+		newCodexTestAuth(server.URL, "stream-stats-key"),
+		newCodexResponsesRequest("verify streaming stats publish timing"),
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	preDeadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(preDeadline) {
+		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				t.Fatalf("unexpected early request statistics record before completed usage: failed=%v total_tokens=%d", detail.Failed, detail.Tokens.TotalTokens)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := runtimeusage.GetRequestStatistics().Snapshot()
+		if apiStats, ok := snapshot.APIs[apiKey]; ok {
+			if modelStats, ok := apiStats.Models["gpt-5.4"]; ok && len(modelStats.Details) > 0 {
+				detail := modelStats.Details[len(modelStats.Details)-1]
+				if detail.Failed {
+					t.Fatal("expected successful request statistics record")
+				}
+				if detail.Tokens.TotalTokens != 8 {
+					t.Fatalf("total tokens = %d, want %d", detail.Tokens.TotalTokens, 8)
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for HTTP streaming usage statistics record for API key %q", apiKey)
 }
 
 func TestCodexExecutorExecute_LocalServer_ConcurrentMixedAccountsRemainIsolated(t *testing.T) {

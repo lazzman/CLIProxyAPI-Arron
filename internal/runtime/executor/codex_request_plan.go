@@ -383,7 +383,6 @@ func newCodexHTTPRequest(ctx context.Context, url string, body []byte, conversat
 		return nil, err
 	}
 	if conversationID != "" {
-		httpReq.Header.Set("Conversation_id", conversationID)
 		httpReq.Header.Set("Session_id", conversationID)
 	}
 	return httpReq, nil
